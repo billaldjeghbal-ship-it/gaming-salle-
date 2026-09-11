@@ -28,3 +28,6 @@ GitHub Actions workflow builds a debug APK and an unsigned release AAB.
 - Backup/restore and cloud sync
 - Arabic/French localization
 - Google Play Billing / licensing
+
+## Build status
+AndroidX/Jetifier configuration fixed for the cloud build.
