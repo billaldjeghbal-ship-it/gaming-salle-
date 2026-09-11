@@ -7,6 +7,7 @@ import android.graphics.Color
 import android.graphics.drawable.GradientDrawable
 import android.view.*
 import android.widget.*
+import com.android.billingclient.api.*
 import java.util.*
 import kotlin.math.roundToInt
 
@@ -21,14 +22,19 @@ data class Device(
 )
 
 class MainActivity : Activity() {
+    companion object { private const val PRO_PRODUCT_ID = "gaming_salle_pro" }
+
     private val prefs by lazy { getSharedPreferences("gaming_salle", MODE_PRIVATE) }
     private val devices = mutableListOf<Device>()
     private var expenses = 0
     private var sessions = 0
     private var hallName = "Gaming Salle"
+    private var isPro = false
     private lateinit var content: LinearLayout
     private lateinit var title: TextView
     private val handler = Handler(Looper.getMainLooper())
+    private lateinit var billingClient: BillingClient
+    private var proProduct: ProductDetails? = null
 
     private val bg = Color.rgb(8,11,18)
     private val panel = Color.rgb(17,24,39)
@@ -41,6 +47,7 @@ class MainActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         load()
+        initBilling()
         if (!prefs.contains("setup_done")) showSetup() else showMain()
         handler.post(object : Runnable {
             override fun run() {
@@ -54,6 +61,7 @@ class MainActivity : Activity() {
         hallName = prefs.getString("hallName", "Gaming Salle") ?: "Gaming Salle"
         expenses = prefs.getInt("expenses", 0)
         sessions = prefs.getInt("sessions", 0)
+        isPro = prefs.getBoolean("pro", false)
         val count = prefs.getInt("deviceCount", 0)
         val prices = prefs.getString("prices", "")!!.split(",")
         val types = prefs.getString("types", "")!!.split(",")
@@ -69,11 +77,99 @@ class MainActivity : Activity() {
             .putString("hallName", hallName)
             .putInt("expenses", expenses)
             .putInt("sessions", sessions)
+            .putBoolean("pro", isPro)
             .putInt("deviceCount", devices.size)
             .putString("prices", devices.joinToString(",") { it.pricePerHour.toString() })
             .putString("types", devices.joinToString(",") { it.type })
             .putString("names", devices.joinToString(",") { it.name })
             .apply()
+    }
+
+    private fun initBilling() {
+        billingClient = BillingClient.newBuilder(this)
+            .setListener { result, purchases ->
+                if (result.responseCode == BillingClient.BillingResponseCode.OK && purchases != null) {
+                    purchases.forEach { handlePurchase(it) }
+                }
+            }
+            .enablePendingPurchases(PendingPurchasesParams.newBuilder().enableOneTimeProducts().build())
+            .enableAutoServiceReconnection()
+            .build()
+        billingClient.startConnection(object : BillingClientStateListener {
+            override fun onBillingSetupFinished(result: BillingResult) {
+                if (result.responseCode == BillingClient.BillingResponseCode.OK) {
+                    queryProProduct()
+                    restoreProPurchase()
+                }
+            }
+            override fun onBillingServiceDisconnected() {}
+        })
+    }
+
+    private fun queryProProduct() {
+        val product = QueryProductDetailsParams.Product.newBuilder()
+            .setProductId(PRO_PRODUCT_ID)
+            .setProductType(BillingClient.ProductType.INAPP)
+            .build()
+        val params = QueryProductDetailsParams.newBuilder().setProductList(listOf(product)).build()
+        billingClient.queryProductDetailsAsync(params) { result, queryResult ->
+            if (result.responseCode == BillingClient.BillingResponseCode.OK) {
+                proProduct = queryResult.productDetailsList.firstOrNull()
+            }
+        }
+    }
+
+    private fun restoreProPurchase() {
+        if (!billingClient.isReady) return
+        val params = QueryPurchasesParams.newBuilder().setProductType(BillingClient.ProductType.INAPP).build()
+        billingClient.queryPurchasesAsync(params) { result, purchases ->
+            if (result.responseCode == BillingClient.BillingResponseCode.OK) {
+                val found = purchases.any { it.products.contains(PRO_PRODUCT_ID) && it.purchaseState == Purchase.PurchaseState.PURCHASED }
+                if (found && !isPro) { isPro = true; save() }
+            }
+        }
+    }
+
+    private fun handlePurchase(purchase: Purchase) {
+        if (purchase.products.contains(PRO_PRODUCT_ID) && purchase.purchaseState == Purchase.PurchaseState.PURCHASED) {
+            isPro = true
+            save()
+            if (!purchase.isAcknowledged) {
+                val params = AcknowledgePurchaseParams.newBuilder().setPurchaseToken(purchase.purchaseToken).build()
+                billingClient.acknowledgePurchase(params) { }
+            }
+            runOnUiThread {
+                Toast.makeText(this, "تم تفعيل Gaming Salle Pro 🎉", Toast.LENGTH_LONG).show()
+                showMain()
+            }
+        }
+    }
+
+    private fun buyPro() {
+        if (!billingClient.isReady) {
+            Toast.makeText(this, "خدمة الدفع غير جاهزة، عاود بعد قليل", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val product = proProduct
+        if (product == null) {
+            Toast.makeText(this, "منتج Pro غير متوفر حالياً. لازم نضيفه في Play Console.", Toast.LENGTH_LONG).show()
+            return
+        }
+        val productParams = BillingFlowParams.ProductDetailsParams.newBuilder()
+            .setProductDetails(product).build()
+        val flow = BillingFlowParams.newBuilder()
+            .setProductDetailsParamsList(listOf(productParams)).build()
+        billingClient.launchBillingFlow(this, flow)
+    }
+
+    private fun showProDialog() {
+        if (isPro) return
+        AlertDialog.Builder(this)
+            .setTitle("Gaming Salle Pro ⭐")
+            .setMessage("افتح النسخة الاحترافية بدفعة واحدة فقط:\n\n• أكثر من 5 أجهزة\n• جميع ميزات الإدارة\n• بدون اشتراك شهري\n• الشراء يبقى مرتبطاً بحساب Google Play")
+            .setPositiveButton("شراء Pro") { _, _ -> buyPro() }
+            .setNegativeButton("لاحقاً", null)
+            .show()
     }
 
     private fun base(): LinearLayout = LinearLayout(this).apply {
@@ -83,35 +179,29 @@ class MainActivity : Activity() {
     }
 
     private fun tv(s: String, size: Float, color: Int = text): TextView = TextView(this).apply {
-        text = s
-        textSize = size
-        setTextColor(color)
-        setPadding(4, 4, 4, 4)
+        text = s; textSize = size; setTextColor(color); setPadding(4, 4, 4, 4)
     }
 
     private fun card(): LinearLayout = LinearLayout(this).apply {
-        orientation = LinearLayout.VERTICAL
-        setPadding(14, 12, 14, 12)
+        orientation = LinearLayout.VERTICAL; setPadding(14, 12, 14, 12)
         background = GradientDrawable().apply { cornerRadius = 22f; setColor(panel) }
     }
 
     private fun button(s: String, onClick: () -> Unit): Button = Button(this).apply {
-        text = s
-        setTextColor(text)
-        textSize = 14f
+        text = s; setTextColor(text); textSize = 14f
         background = GradientDrawable().apply { cornerRadius = 18f; setColor(accent) }
         setOnClickListener { onClick() }
     }
 
     private fun showSetup() {
-        val root = base()
-        root.gravity = Gravity.CENTER_HORIZONTAL
+        val root = base(); root.gravity = Gravity.CENTER_HORIZONTAL
         val logo = ImageView(this)
         val res = resources.getIdentifier("gaming_salle_logo", "drawable", packageName)
         if (res != 0) logo.setImageResource(res)
         root.addView(logo, LinearLayout.LayoutParams(-1, 260))
         root.addView(tv("Gaming Salle", 30f), LinearLayout.LayoutParams(-2, -2))
         root.addView(tv("Gestion professionnelle de salle de jeux", 15f, muted))
+        if (!isPro) root.addView(tv("Version gratuite • حتى 5 أجهزة", 13f, accent))
         val name = EditText(this).apply { hint = "اسم القاعة"; setTextColor(text); setHintTextColor(muted) }
         val count = EditText(this).apply { hint = "عدد الأجهزة"; inputType = 2; setTextColor(text); setHintTextColor(muted) }
         val price = EditText(this).apply { hint = "السعر بالساعة (دج)"; inputType = 2; setTextColor(text); setHintTextColor(muted) }
@@ -119,23 +209,21 @@ class MainActivity : Activity() {
         root.addView(count, LinearLayout.LayoutParams(-1, 60))
         root.addView(price, LinearLayout.LayoutParams(-1, 60))
         root.addView(button("ابدأ إعداد القاعة") {
+            val n = (count.text.toString().toIntOrNull() ?: 5).coerceIn(1,100)
+            if (!isPro && n > 5) { showProDialog(); return@button }
             hallName = name.text.toString().ifBlank { "Gaming Salle" }
-            val n = (count.text.toString().toIntOrNull() ?: 10).coerceIn(1,100)
             val p = (price.text.toString().toIntOrNull() ?: 100).coerceAtLeast(0)
-            devices.clear()
-            repeat(n) { devices.add(Device(it+1, "Poste ${it+1}", "PS5", p)) }
-            prefs.edit().putBoolean("setup_done", true).apply()
-            save()
-            showMain()
+            devices.clear(); repeat(n) { devices.add(Device(it+1, "Poste ${it+1}", "PS5", p)) }
+            prefs.edit().putBoolean("setup_done", true).apply(); save(); showMain()
         }, LinearLayout.LayoutParams(-1, 58).apply { topMargin = 18 })
+        if (!isPro) root.addView(button("⭐ ترقية إلى Pro") { showProDialog() }, LinearLayout.LayoutParams(-1,58).apply { topMargin=10 })
         setContentView(root)
     }
 
     private fun showMain() {
         val root = base()
         val header = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }
-        title = tv(hallName, 24f)
-        header.addView(title, LinearLayout.LayoutParams(0, -2, 1f))
+        title = tv(hallName, 24f); header.addView(title, LinearLayout.LayoutParams(0, -2, 1f))
         header.addView(button("⚙") { showSettings() }, LinearLayout.LayoutParams(60, 52))
         root.addView(header)
         val nav = LinearLayout(this)
@@ -144,11 +232,8 @@ class MainActivity : Activity() {
         nav.addView(button("التقارير") { showReports() }, LinearLayout.LayoutParams(0,52,1f))
         root.addView(nav)
         content = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        val scroll = ScrollView(this)
-        scroll.addView(content)
-        root.addView(scroll, LinearLayout.LayoutParams(-1,0,1f))
-        setContentView(root)
-        refreshDashboard()
+        val scroll = ScrollView(this); scroll.addView(content)
+        root.addView(scroll, LinearLayout.LayoutParams(-1,0,1f)); setContentView(root); refreshDashboard()
     }
 
     private fun refreshDashboard() {
@@ -158,44 +243,26 @@ class MainActivity : Activity() {
         val active = devices.count { it.running }
         val hours = devices.sumOf { currentMinutes(it) } / 60.0
         val row = LinearLayout(this)
-        val stats = listOf(
-            "مداخيل اليوم" to "${today} دج",
-            "الأجهزة شغالة" to "$active / ${devices.size}",
-            "الساعات المباعة" to String.format(Locale.US,"%.1f", hours),
-            "الحصص" to sessions.toString()
-        )
-        stats.forEach { (a,b) ->
-            val c=card(); c.addView(tv(a,12f,muted)); c.addView(tv(b,18f))
-            row.addView(c, LinearLayout.LayoutParams(0,100,1f).apply { marginEnd=6 })
-        }
-        content.addView(row)
-        content.addView(tv("الأجهزة",20f).apply { setPadding(4,20,4,10) })
-        devices.forEach { addDeviceCard(it) }
+        val stats = listOf("مداخيل اليوم" to "${today} دج", "الأجهزة شغالة" to "$active / ${devices.size}", "الساعات المباعة" to String.format(Locale.US,"%.1f", hours), "الحصص" to sessions.toString())
+        stats.forEach { (a,b) -> val c=card(); c.addView(tv(a,12f,muted)); c.addView(tv(b,18f)); row.addView(c, LinearLayout.LayoutParams(0,100,1f).apply { marginEnd=6 }) }
+        content.addView(row); content.addView(tv("الأجهزة",20f).apply { setPadding(4,20,4,10) }); devices.forEach { addDeviceCard(it) }
     }
 
     private fun addDeviceCard(d: Device) {
-        val c=card()
-        val head=LinearLayout(this)
-        val state=if(d.running) "● شغال" else "○ فارغ"
-        val stateColor=if(d.running) success else muted
-        head.addView(tv("${d.name} • ${d.type}",17f), LinearLayout.LayoutParams(0,-2,1f))
-        head.addView(tv(state,13f,stateColor))
-        c.addView(head)
-        val charge=currentCharge(d)
-        val mins=currentMinutes(d)
+        val c=card(); val head=LinearLayout(this)
+        val state=if(d.running) "● شغال" else "○ فارغ"; val stateColor=if(d.running) success else muted
+        head.addView(tv("${d.name} • ${d.type}",17f), LinearLayout.LayoutParams(0,-2,1f)); head.addView(tv(state,13f,stateColor)); c.addView(head)
+        val charge=currentCharge(d); val mins=currentMinutes(d)
         c.addView(tv(if(d.running) "الوقت: ${formatMinutes(mins)}   |   الحساب: $charge دج" else "السعر: ${d.pricePerHour} دج / ساعة",14f,muted))
         val actions=LinearLayout(this)
-        if(d.running) actions.addView(button("إيقاف") { stopDevice(d) }, LinearLayout.LayoutParams(0,50,1f))
-        else actions.addView(button("بدء الحصة") { startDevice(d) }, LinearLayout.LayoutParams(0,50,1f))
-        actions.addView(button("تعديل") { editDevice(d) }, LinearLayout.LayoutParams(0,50,1f).apply{marginStart=8})
-        c.addView(actions)
-        content.addView(c, LinearLayout.LayoutParams(-1,0).apply { height=150; bottomMargin=10 })
+        if(d.running) actions.addView(button("إيقاف") { stopDevice(d) }, LinearLayout.LayoutParams(0,50,1f)) else actions.addView(button("بدء الحصة") { startDevice(d) }, LinearLayout.LayoutParams(0,50,1f))
+        actions.addView(button("تعديل") { editDevice(d) }, LinearLayout.LayoutParams(0,50,1f).apply{marginStart=8}); c.addView(actions)
+        content.addView(c, LinearLayout.LayoutParams(-1,150).apply { bottomMargin=10 })
     }
 
     private fun currentMinutes(d: Device): Int = if (!d.running || d.startedAt==0L) 0 else ((System.currentTimeMillis()-d.startedAt)/60000L).toInt().coerceAtLeast(0)
     private fun currentCharge(d: Device): Int = if (!d.running) 0 else ((currentMinutes(d)/60.0)*d.pricePerHour).roundToInt()
     private fun formatMinutes(m:Int) = "%02d:%02d".format(m/60,m%60)
-
     private fun startDevice(d:Device) { d.running=true; d.startedAt=System.currentTimeMillis(); sessions++; save(); refreshDashboard() }
     private fun stopDevice(d:Device) { d.revenue += currentCharge(d); d.running=false; d.startedAt=0L; save(); refreshDashboard() }
 
@@ -204,47 +271,32 @@ class MainActivity : Activity() {
         val name=EditText(this); name.setText(d.name); name.setTextColor(text); box.addView(name)
         val price=EditText(this); price.setText(d.pricePerHour.toString()); price.inputType=2; price.setTextColor(text); box.addView(price)
         val type=EditText(this); type.setText(d.type); type.setTextColor(text); box.addView(type)
-        AlertDialog.Builder(this).setTitle("تعديل الجهاز").setView(box)
-            .setPositiveButton("حفظ"){_,_-> d.name=name.text.toString().ifBlank{d.name}; d.type=type.text.toString().ifBlank{d.type}; d.pricePerHour=price.text.toString().toIntOrNull()?:d.pricePerHour; save(); refreshDashboard()}
-            .setNegativeButton("إلغاء",null).show()
+        AlertDialog.Builder(this).setTitle("تعديل الجهاز").setView(box).setPositiveButton("حفظ"){_,_-> d.name=name.text.toString().ifBlank{d.name}; d.type=type.text.toString().ifBlank{d.type}; d.pricePerHour=price.text.toString().toIntOrNull()?:d.pricePerHour; save(); refreshDashboard()}.setNegativeButton("إلغاء",null).show()
     }
 
     private fun showDevices() {
-        showMain()
-        content.removeAllViews()
-        content.addView(tv("إدارة الأجهزة",24f))
-        content.addView(tv("يمكنك تعديل الاسم والنوع والسعر لكل جهاز.",14f,muted))
-        devices.forEach { addDeviceCard(it) }
+        showMain(); content.removeAllViews(); content.addView(tv("إدارة الأجهزة",24f)); content.addView(tv(if(isPro) "نسخة Pro • أجهزة غير محدودة" else "النسخة المجانية • حتى 5 أجهزة",14f,muted)); devices.forEach { addDeviceCard(it) }
         content.addView(button("+ إضافة جهاز"){
-            val id=devices.size+1
-            devices.add(Device(id,"Poste $id","PS5",100)); save(); showDevices()
+            if (!isPro && devices.size >= 5) { showProDialog(); return@button }
+            val id=devices.size+1; devices.add(Device(id,"Poste $id","PS5",100)); save(); showDevices()
         })
     }
 
     private fun showReports() {
-        showMain()
-        content.removeAllViews()
-        val revenue=devices.sumOf{it.revenue+currentCharge(it)}
-        content.addView(tv("التقارير",24f))
-        val c=card()
-        c.addView(tv("إجمالي المداخيل المسجلة",14f,muted))
-        c.addView(tv("$revenue دج",28f))
-        c.addView(tv("المصاريف: $expenses دج",15f,muted))
-        c.addView(tv("الربح التقريبي: ${revenue-expenses} دج",19f, if(revenue-expenses>=0)success else danger))
-        c.addView(tv("عدد الحصص: $sessions",15f,muted))
-        content.addView(c)
+        showMain(); content.removeAllViews(); val revenue=devices.sumOf{it.revenue+currentCharge(it)}
+        content.addView(tv("التقارير",24f)); val c=card(); c.addView(tv("إجمالي المداخيل المسجلة",14f,muted)); c.addView(tv("$revenue دج",28f)); c.addView(tv("المصاريف: $expenses دج",15f,muted)); c.addView(tv("الربح التقريبي: ${revenue-expenses} دج",19f,if(revenue-expenses>=0)success else danger)); c.addView(tv("عدد الحصص: $sessions",15f,muted)); content.addView(c)
         content.addView(tv("ملاحظة: النسخة الحالية تحفظ البيانات محلياً على الهاتف.",13f,muted).apply{setPadding(4,20,4,4)})
     }
 
     private fun showSettings() {
         val box=LinearLayout(this).apply { orientation=LinearLayout.VERTICAL; setPadding(25,10,25,5) }
         val name=EditText(this); name.setText(hallName); name.setTextColor(text); box.addView(name)
-        val exp=EditText(this); exp.setHint("المصاريف"); exp.setText(expenses.toString()); exp.inputType=2; exp.setTextColor(text); box.addView(exp)
+        val exp=EditText(this); exp.hint="المصاريف"; exp.setText(expenses.toString()); exp.inputType=2; exp.setTextColor(text); box.addView(exp)
         AlertDialog.Builder(this).setTitle("إعدادات Gaming Salle").setView(box)
             .setPositiveButton("حفظ"){_,_-> hallName=name.text.toString().ifBlank{"Gaming Salle"}; expenses=exp.text.toString().toIntOrNull()?:expenses; save(); showMain()}
-            .setNeutralButton("مسح كل البيانات"){_,_-> prefs.edit().clear().apply(); devices.clear(); expenses=0; sessions=0; showSetup()}
+            .setNeutralButton(if(isPro) "Pro مفعل ⭐" else "⭐ شراء Gaming Salle Pro"){_,_-> if(!isPro) buyPro()}
             .setNegativeButton("إلغاء",null).show()
     }
 
-    override fun onDestroy() { super.onDestroy(); handler.removeCallbacksAndMessages(null) }
+    override fun onDestroy() { super.onDestroy(); handler.removeCallbacksAndMessages(null); if (::billingClient.isInitialized) billingClient.endConnection() }
 }
